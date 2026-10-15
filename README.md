@@ -97,20 +97,26 @@ immediately rather than interleaving changes.
 ## Install for Claude Code
 
 Claude Code does not read `~/.agents/skills`, and it only discovers skills one
-level deep, so the nested `_managed/` tree is invisible to it. After a sync,
-copy every authored and managed skill flat into `~/.claude/skills`:
+level deep, so the nested `_managed/` tree is invisible to it. `skillctl sync`
+therefore finishes by copying every authored and managed skill flat into
+`~/.claude/skills`. Run the copy on its own after editing an authored skill:
 
 ```sh
 uv run --locked skillctl install-claude --dry-run
 uv run --locked skillctl install-claude
 ```
 
-Pass `--target` to install somewhere else. The command records what it
-installed in `<target>/.skillctl-owned` and only replaces or removes those
-entries; other content, such as Claude's own `synced/` directory, is left
-alone. It fails without changing anything if a skill name already exists in
-the target but is not recorded as owned. Copies are snapshots, so rerun the
-command after editing an authored skill or synchronizing.
+Pass `--claude-target` to install somewhere else, or `sync --no-claude` to
+skip the copy. The command records what it installed in
+`<target>/.skillctl-owned` and only replaces or removes those entries; other
+content, such as Claude's own `synced/` directory, is left alone. It fails
+without changing anything if a skill name already exists in the target but is
+not recorded as owned.
+
+Set `claude: false` on a dependency to keep its skills out of Claude Code
+while still materializing them in `_managed/`. Use it for skills a repository
+already ships in its own `.claude/skills`, which Claude loads when working in
+that repository. It requires `explicit` selection.
 
 ## Add or Edit an Authored Skill
 
@@ -148,7 +154,8 @@ its behavior is machine-checkable, then run the complete validation suite.
 
 Public dependencies belong in `deps.yaml`. Each entry requires a stable ID, an
 HTTPS GitHub URL, and exactly one selection mode. An optional `ref` pins a tag,
-branch, or commit; optional `sparse` paths limit checkout size.
+branch, or commit; optional `sparse` paths limit checkout size; optional
+`claude: false` hides the dependency from Claude Code.
 
 Use `explicit` when the exact upstream-to-local mappings are known:
 
@@ -177,6 +184,37 @@ beneath one upstream root should be installed:
     exclude:
       - experimental-skill
 ```
+
+### Route Large Collections
+
+Every installed skill's name and description sits in each agent session, so a
+collection of dozens of skills crowds discovery even when it is rarely used.
+Add a `router` to collapse a dependency into one skill:
+
+```yaml
+- id: example-collection
+  url: https://github.com/example/agent-skills.git
+  router:
+    name: example-skills
+    description: >-
+      Use for Example work: the concrete situations any of its skills cover.
+  selection:
+    mode: explicit
+    include:
+      - source: skills/reviewing
+        destination: reviewing
+```
+
+`skillctl sync` installs `_managed/example-skills/SKILL.md`, an index of each
+selected skill with its description, and nests the skills under
+`_managed/example-skills/skills/<destination>/`. Each nested `SKILL.md` is
+renamed `GUIDE.md` so harnesses that search recursively still discover only the
+router. The agent loads the router, picks a guide, and follows it. Write the
+router description to cover every situation its skills handle; it is the only
+text agents see before loading it.
+
+Nested destinations only need to be unique within their router. A nested skill
+cannot be invoked directly by name.
 
 Prefer explicit selection when only a reviewed subset is wanted. Before
 committing a dependency change, run a dry run, inspect the resolved tree, apply

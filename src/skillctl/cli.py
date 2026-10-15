@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import json
 import re
 import shutil
 import subprocess
@@ -119,7 +120,7 @@ def normalize_dependency(raw, context, *, base):
     item = require_mapping(raw, context)
     require_keys(
         item,
-        {"id", "url", "ref", "sparse", "selection"},
+        {"id", "url", "ref", "sparse", "selection", "claude", "router"},
         {"id", "url", "selection"},
         context,
     )
@@ -144,6 +145,27 @@ def normalize_dependency(raw, context, *, base):
         sparse = unique_strings(sparse, f"{context}.sparse", paths=True)
         if not sparse:
             raise ManifestError(f"{context}.sparse must not be empty")
+
+    claude = item.get("claude", True)
+    if not isinstance(claude, bool):
+        raise ManifestError(f"{context}.claude must be a boolean")
+
+    router = item.get("router")
+    if router is not None:
+        router = require_mapping(router, f"{context}.router")
+        require_keys(
+            router,
+            {"name", "description"},
+            {"name", "description"},
+            f"{context}.router",
+        )
+        description = router["description"]
+        if not isinstance(description, str) or not description.strip():
+            raise ManifestError(f"{context}.router.description must be a string")
+        router = {
+            "name": safe_name(router["name"], f"{context}.router.name"),
+            "description": " ".join(description.split()),
+        }
 
     selection = require_mapping(item["selection"], f"{context}.selection")
     mode = selection.get("mode")
@@ -184,6 +206,10 @@ def normalize_dependency(raw, context, *, base):
         normalized_selection = {"mode": mode, "root": root, "exclude": exclude}
     else:
         raise ManifestError(f"{context}.selection.mode must be explicit or discovery")
+    if not claude and mode != "explicit" and router is None:
+        raise ManifestError(
+            f"{context}.claude: false requires explicit selection or a router"
+        )
 
     return {
         "id": dependency_id,
@@ -191,6 +217,8 @@ def normalize_dependency(raw, context, *, base):
         "ref": ref,
         "sparse": sparse,
         "selection": normalized_selection,
+        "claude": claude,
+        "router": router,
     }
 
 
@@ -201,14 +229,21 @@ def load_yaml(path):
         raise ManifestError(f"cannot read {path.name}: {error}") from error
 
 
+def top_level_names(dependency):
+    """Names a dependency occupies directly under _managed, when known statically."""
+    if dependency["router"]:
+        return [dependency["router"]["name"]]
+    if dependency["selection"]["mode"] == "explicit":
+        return [
+            mapping["destination"] for mapping in dependency["selection"]["include"]
+        ]
+    return []
+
+
 def validate_destinations(dependencies, durable_roots):
     owners = {}
     for dependency in dependencies:
-        selection = dependency["selection"]
-        if selection["mode"] != "explicit":
-            continue
-        for mapping in selection["include"]:
-            destination = mapping["destination"]
+        for destination in top_level_names(dependency):
             if destination in durable_roots:
                 raise ManifestError(
                     f"managed destination {destination} collides with an authored skill"
@@ -416,6 +451,39 @@ def set_skill_name(skill_dir, name):
     skill_file.write_text(content, encoding="utf-8")
 
 
+ROUTED_GUIDE = "GUIDE.md"
+
+
+def write_router(router_dir, router, members):
+    lines = [
+        "---",
+        f"name: {router['name']}",
+        f"description: {json.dumps(router['description'])}",
+        "---",
+        "",
+        f"# {router['name']}",
+        "",
+        f"This skill indexes {len(members)} skills. Pick the one that matches the "
+        "task, read its guide, and follow it exactly as if it had been loaded as a "
+        "skill. Resolve relative paths in a guide from that guide's directory.",
+        "",
+    ]
+    for member in sorted(members):
+        guide = router_dir / "skills" / member / ROUTED_GUIDE
+        match = FRONTMATTER.match(guide.read_text(encoding="utf-8"))
+        try:
+            metadata = yaml.safe_load(match.group(1)) if match else None
+        except yaml.YAMLError:
+            metadata = None
+        description = (
+            metadata.get("description") if isinstance(metadata, dict) else None
+        )
+        summary = " ".join(str(description or "").split())
+        entry = f"- `{member}` (`skills/{member}/{ROUTED_GUIDE}`)"
+        lines.append(f"{entry}: {summary}" if summary else entry)
+    (router_dir / "SKILL.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def materialize(repo_root, dependencies, durable_roots, *, dry_run):
     with sync_lock(repo_root):
         with tempfile.TemporaryDirectory(
@@ -427,6 +495,7 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
             clones_root.mkdir()
             stage.mkdir()
             selected = []
+            routers = []
             destinations = set()
 
             for dependency in dependencies:
@@ -467,15 +536,32 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
                         and (child / "SKILL.md").is_file()
                     ]
 
-                for mapping in mappings:
-                    destination = mapping["destination"]
+                router = dependency["router"]
+                if router:
+                    destination = router["name"]
                     if destination in durable_roots:
                         raise RuntimeError(
-                            f"managed destination {destination} collides with "
-                            "an authored skill"
+                            f"router {destination} collides with an authored skill"
                         )
                     if destination in destinations:
                         raise RuntimeError(f"duplicate destination {destination}")
+                    destinations.add(destination)
+                    routers.append((router, [m["destination"] for m in mappings]))
+
+                for mapping in mappings:
+                    destination = mapping["destination"]
+                    if router:
+                        relative = Path(router["name"], "skills", destination)
+                    else:
+                        if destination in durable_roots:
+                            raise RuntimeError(
+                                f"managed destination {destination} collides with "
+                                "an authored skill"
+                            )
+                        if destination in destinations:
+                            raise RuntimeError(f"duplicate destination {destination}")
+                        destinations.add(destination)
+                        relative = Path(destination)
                     source = (
                         clone if mapping["source"] == "." else clone / mapping["source"]
                     )
@@ -485,16 +571,24 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
                             f"{mapping['source']}"
                         )
                     ensure_safe_tree(source, clone)
-                    destinations.add(destination)
-                    selected.append((source, destination))
+                    selected.append((source, relative, router is not None))
 
-            for source, destination in selected:
+            for source, relative, routed in selected:
                 shutil.copytree(
                     source,
-                    stage / destination,
+                    stage / relative,
                     ignore=shutil.ignore_patterns(".git"),
                 )
-                set_skill_name(stage / destination, destination)
+                set_skill_name(stage / relative, relative.name)
+                if routed:
+                    # Renamed so harnesses that search recursively for SKILL.md
+                    # only discover the router.
+                    (stage / relative / "SKILL.md").rename(
+                        stage / relative / ROUTED_GUIDE
+                    )
+
+            for router, members in routers:
+                write_router(stage / router["name"], router, members)
 
             current = repo_root / "_managed"
             old_names = (
@@ -531,18 +625,29 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
 CLAUDE_OWNED = ".skillctl-owned"
 
 
-def install_claude(repo_root, durable_roots, target, *, dry_run):
+def install_claude(repo_root, dependencies, durable_roots, target, *, dry_run):
     """Copy authored and managed skills flat into a Claude Code skills directory.
 
-    Only entries recorded in the ownership file are replaced or removed, so
-    skills that other tools put in the target are never touched.
+    Skills from dependencies marked `claude: false` are left out. Only entries
+    recorded in the ownership file are replaced or removed, so skills that
+    other tools put in the target are never touched.
     """
+    hidden = {
+        name
+        for dependency in dependencies
+        if not dependency["claude"]
+        for name in top_level_names(dependency)
+    }
     with sync_lock(repo_root):
         managed = repo_root / "_managed"
         sources = {name: repo_root / name for name in durable_roots}
         if managed.is_dir():
             for path in managed.iterdir():
-                if path.is_dir() and (path / "SKILL.md").is_file():
+                if (
+                    path.name not in hidden
+                    and path.is_dir()
+                    and (path / "SKILL.md").is_file()
+                ):
                     sources[path.name] = path
 
         target.mkdir(parents=True, exist_ok=True)
@@ -606,21 +711,31 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", required=True)
     sync_parser = subparsers.add_parser("sync")
     sync_parser.add_argument("--dry-run", action="store_true")
+    sync_parser.add_argument(
+        "--no-claude", action="store_true", help="skip the Claude Code install"
+    )
     claude_parser = subparsers.add_parser(
         "install-claude", help="copy skills flat into a Claude Code skills directory"
     )
     claude_parser.add_argument("--dry-run", action="store_true")
-    claude_parser.add_argument(
-        "--target", type=Path, default=Path.home() / ".claude" / "skills"
-    )
+    for subparser in (sync_parser, claude_parser):
+        subparser.add_argument(
+            "--claude-target", type=Path, default=Path.home() / ".claude" / "skills"
+        )
     args = parser.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     try:
         dependencies, durable_roots = load_manifest(repo_root)
         if args.command == "sync":
             materialize(repo_root, dependencies, durable_roots, dry_run=args.dry_run)
-        else:
-            install_claude(repo_root, durable_roots, args.target, dry_run=args.dry_run)
+        if args.command == "install-claude" or not args.no_claude:
+            install_claude(
+                repo_root,
+                dependencies,
+                durable_roots,
+                args.claude_target,
+                dry_run=args.dry_run,
+            )
     except (
         ManifestError,
         RuntimeError,
