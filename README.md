@@ -62,7 +62,7 @@ configuration have been preserved.
 | `uv.lock` | Generated and tracked | Reproducible Python dependency lockfile |
 
 Never edit `_managed/` directly. It is disposable output owned by `skillctl`;
-the next successful synchronization replaces it wholesale. Change `deps.yaml`,
+the next successful synchronization repairs any local changes. Change `deps.yaml`,
 `deps.local.yaml`, or the upstream repository instead.
 
 ## Synchronize Dependencies
@@ -89,10 +89,44 @@ destination directory name. Upstream collections often reuse generic names
 such as `testing` or `review`; destinations are unique, so the rewritten names
 are too, and runtimes that index by `name` see no collisions.
 
-Acquisition and validation happen in a staging directory. A successful run
-atomically replaces `_managed/`; a failed run leaves the previous live tree in
-place. The ignored `.skillctl.lock` serializes runs, and a concurrent run fails
-immediately rather than interleaving changes.
+`skillctl` keeps disposable Git checkouts in `~/.cache/skillctl/`, or
+`$XDG_CACHE_HOME/skillctl/` when `XDG_CACHE_HOME` is an absolute path. It refreshes
+up to four dependencies concurrently, reusing downloaded Git objects. Every run
+checks upstream; a failed fetch never falls back to stale cached content.
+
+The ignored `.skillctl.lock` records each dependency's URL, requested ref, and
+exact resolved commit, together with selected Git subtree IDs, dependency
+settings, generator source, and a fingerprint of installed output. If the
+generation inputs and live output still match, generation and replacement are skipped.
+Upstream changes outside selected paths do not require regeneration. Sources
+with repository-local symlinks use the full repository tree ID because their
+targets may sit outside the selected paths.
+
+Changed inputs trigger validation and generation of a complete staging tree.
+If its contents differ, the whole `_managed/` tree is replaced using the existing
+rename-and-rollback procedure. Renames, removals, discovery changes, and router
+changes therefore remove obsolete output. Identical output stays in place even
+when inputs changed. Acquisition or validation failure leaves the live tree in
+place; an installation rename failure restores it.
+
+The same `.skillctl.lock` also serializes runs through an operating-system lock.
+Metadata is written in place while that lock is held, preserving the file's
+inode and preventing concurrent runs from bypassing it. An empty, corrupt, or
+interrupted metadata write triggers regeneration on the next run. A shared
+cache lock also prevents different checkouts from modifying cached repositories
+during staging. A concurrent run fails immediately rather than interleaving changes.
+
+`sync` checks upstream and refreshes the recorded resolutions on every successful
+run, including when changes outside selected paths leave installed output
+unchanged. Use a manifest `ref` to pin a dependency. The lockfile remains local
+because it includes machine-local dependencies and installation state.
+
+Dry runs may refresh the Git cache but leave installed output and existing
+lockfile contents unchanged. Between runs, deleting the cache or lockfile is
+safe; the next sync downloads or regenerates what it needs. Do not delete the
+lockfile during a run. Cache entries are keyed by dependency ID, URL, ref, and
+sparse paths; entries for old configurations can be removed by deleting
+`~/.cache/skillctl/` (or its configured equivalent).
 
 ## Install for Claude Code
 
@@ -109,7 +143,9 @@ uv run --locked skillctl install-claude
 Pass `--claude-target` to install somewhere else, or `sync --no-claude` to
 skip the copy. The command records what it installed in
 `<target>/.skillctl-owned` and only replaces or removes those entries; other
-content, such as Claude's own `synced/` directory, is left alone. It fails
+content, such as Claude's own `synced/` directory, is left alone. Unchanged skills
+stay in place; changed owned entries are replaced and deselected owned entries
+are removed. It fails
 without changing anything if a skill name already exists in the target but is
 not recorded as owned.
 

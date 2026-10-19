@@ -4,13 +4,17 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -368,7 +372,7 @@ def load_manifest(repo_root):
 
 
 def run_git(args, *, cwd=None):
-    subprocess.run(
+    result = subprocess.run(
         ["git", *args],
         cwd=cwd,
         check=True,
@@ -376,10 +380,16 @@ def run_git(args, *, cwd=None):
         stderr=subprocess.PIPE,
         text=True,
     )
+    return result.stdout.strip()
 
 
 def ensure_safe_tree(source, clone_root):
     clone_root = clone_root.resolve()
+    try:
+        source.resolve(strict=True).relative_to(clone_root)
+    except (FileNotFoundError, ValueError) as error:
+        raise RuntimeError(f"source symlink escapes repository: {source}") from error
+
     for path in [source, *source.rglob("*")]:
         if path.is_symlink():
             try:
@@ -390,43 +400,121 @@ def ensure_safe_tree(source, clone_root):
                 ) from error
 
 
+def tree_fingerprint(root):
+    """Include paths, types, permissions and contents, without following links."""
+    if not root.is_dir() or root.is_symlink():
+        return None
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            content = os.readlink(path).encode()
+        elif stat.S_ISREG(mode):
+            content = path.read_bytes()
+        elif stat.S_ISDIR(mode):
+            content = b""
+        else:
+            raise RuntimeError(f"unsupported skill file: {path}")
+
+        digest.update(json.dumps([relative.as_posix(), mode, len(content)]).encode())
+        digest.update(b"\n")
+        digest.update(content)
+
+    return digest.hexdigest()
+
+
 def trees_equal(left, right):
-    left_paths = {
-        path.relative_to(left)
-        for path in left.rglob("*")
-        if not any(part == ".git" for part in path.relative_to(left).parts)
-    }
-    right_paths = {
-        path.relative_to(right)
-        for path in right.rglob("*")
-        if not any(part == ".git" for part in path.relative_to(right).parts)
-    }
-    if left_paths != right_paths:
-        return False
-    for relative in left_paths:
-        left_path = left / relative
-        right_path = right / relative
-        if left_path.is_symlink() != right_path.is_symlink():
-            return False
-        if left_path.is_file() and not left_path.is_symlink():
-            if left_path.read_bytes() != right_path.read_bytes():
-                return False
-    return True
+    fingerprint = tree_fingerprint(left)
+    return fingerprint is not None and fingerprint == tree_fingerprint(right)
+
+
+def git_cache_root():
+    configured = Path(os.environ.get("XDG_CACHE_HOME", ""))
+    base = configured if configured.is_absolute() else Path.home() / ".cache"
+    return base / "skillctl"
+
+
+def acquire_dependency(dependency, cache_root):
+    """Refresh a disposable checkout; caller holds the shared cache lock."""
+    identity = [dependency[key] for key in ("id", "url", "ref", "sparse")]
+    key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    clone = cache_root / "repos" / key
+    if clone.exists():
+        try:
+            git_dir = run_git(["rev-parse", "--absolute-git-dir"], cwd=clone)
+            if Path(git_dir).resolve() != (clone / ".git").resolve():
+                raise RuntimeError("invalid cached repository")
+
+            if (
+                run_git(["config", "--get", "remote.origin.url"], cwd=clone)
+                != dependency["url"]
+            ):
+                raise RuntimeError("cached origin changed")
+        except (subprocess.CalledProcessError, RuntimeError):
+            shutil.rmtree(clone)
+
+    if not clone.exists():
+        clone.mkdir(parents=True)
+        run_git(["init", "--quiet", str(clone)])
+        run_git(["remote", "add", "origin", dependency["url"]], cwd=clone)
+
+    try:
+        run_git(
+            [
+                "fetch",
+                "--depth",
+                "1",
+                "--filter=blob:none",
+                "--no-tags",
+                "--force",
+                "origin",
+                dependency["ref"] or "HEAD",
+            ],
+            cwd=clone,
+        )
+        if dependency["sparse"]:
+            run_git(["sparse-checkout", "set", *dependency["sparse"]], cwd=clone)
+
+        run_git(["checkout", "--force", "--detach", "FETCH_HEAD"], cwd=clone)
+        run_git(["clean", "-ffdx"], cwd=clone)
+    except subprocess.CalledProcessError:
+        # Never use stale content after a failed refresh. Recreate on the next run.
+        shutil.rmtree(clone)
+        raise
+
+    return clone
 
 
 @contextlib.contextmanager
 def sync_lock(repo_root):
     lock_path = repo_root / ".skillctl.lock"
-    with lock_path.open("a+") as lock_file:
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as lock_file:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another sync is in progress") from error
 
         try:
-            yield
+            yield lock_file
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def write_sync_lock(lock_file, dependencies, state):
+    """Update metadata in place: replacing the inode would bypass flock."""
+    lock_file.seek(0)
+    json.dump(
+        {"version": 1, "dependencies": dependencies, "state": state},
+        lock_file,
+        indent=2,
+    )
+    lock_file.write("\n")
+    lock_file.truncate()
+    lock_file.flush()
+    os.fsync(lock_file.fileno())
 
 
 FRONTMATTER = re.compile(r"\A---\n(.*?)^---[ \t]*$", re.S | re.M)
@@ -516,34 +604,42 @@ def write_router(router_dir, router, members):
 
 
 def materialize(repo_root, dependencies, durable_roots, *, dry_run):
-    with sync_lock(repo_root):
+    cache_root = git_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    # Shared checkouts stay locked through staging, including across worktrees.
+    with sync_lock(repo_root) as lock_file, sync_lock(cache_root):
+        try:
+            previous_lock = json.load(lock_file)
+        except (ValueError, UnicodeError):
+            previous_lock = None
+
+        if not isinstance(previous_lock, dict) or previous_lock.get("version") != 1:
+            previous_lock = {}
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            clones = list(
+                executor.map(
+                    acquire_dependency, dependencies, [cache_root] * len(dependencies)
+                )
+            )
+
         with tempfile.TemporaryDirectory(
             prefix=".skills-sync-", dir=repo_root.parent
         ) as temporary:
-            temporary_root = Path(temporary)
-            clones_root = temporary_root / "clones"
-            stage = temporary_root / "_managed"
-            clones_root.mkdir()
+            stage = Path(temporary) / "_managed"
             stage.mkdir()
             selected = []
             routers = []
             destinations = set()
+            resolved_dependencies = []
+            inputs = {
+                "generator": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "durable_roots": sorted(durable_roots),
+                "dependencies": [],
+            }
 
-            for dependency in dependencies:
-                clone = clones_root / dependency["id"]
-                args = ["clone", "--filter=blob:none", "--depth", "1"]
-                if dependency["sparse"]:
-                    args.append("--sparse")
-                if dependency["ref"]:
-                    args.extend(["--branch", dependency["ref"]])
-                args.extend([dependency["url"], str(clone)])
-                run_git(args)
-                if dependency["sparse"]:
-                    run_git(
-                        ["sparse-checkout", "set", *dependency["sparse"]],
-                        cwd=clone,
-                    )
-
+            for dependency, clone in zip(dependencies, clones):
+                dependency_sources = []
                 selection = dependency["selection"]
                 if selection["mode"] == "explicit":
                     mappings = selection["include"]
@@ -602,7 +698,63 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
                             f"{mapping['source']}"
                         )
                     ensure_safe_tree(source, clone)
+                    dependency_sources.append(source)
                     selected.append((source, relative, router is not None))
+
+                paths = (
+                    [m["source"] for m in mappings]
+                    if selection["mode"] == "explicit"
+                    else [selection["root"]]
+                )
+                # Copying follows safe repository-local symlinks, whose targets
+                # can change outside the selected Git subtrees.
+                if any(
+                    path.is_symlink()
+                    for source in dependency_sources
+                    for path in [
+                        source,
+                        *[clone / p for p in source.relative_to(clone).parents],
+                        *source.rglob("*"),
+                    ]
+                ):
+                    paths = ["."]
+
+                revisions = run_git(
+                    [
+                        "rev-parse",
+                        "HEAD",
+                        *["HEAD^{tree}" if p == "." else f"HEAD:{p}" for p in paths],
+                    ],
+                    cwd=clone,
+                ).splitlines()
+                inputs["dependencies"].append(
+                    {"config": dependency, "trees": revisions[1:]}
+                )
+                resolved_dependencies.append(
+                    {
+                        "id": dependency["id"],
+                        "url": dependency["url"],
+                        "ref": dependency["ref"] or "HEAD",
+                        "commit": revisions[0],
+                    }
+                )
+
+            current = repo_root / "_managed"
+            live_fingerprint = tree_fingerprint(current)
+            state = {
+                "inputs": inputs,
+                "output": live_fingerprint,
+            }
+            if live_fingerprint is not None and previous_lock.get("state") == state:
+                if (
+                    not dry_run
+                    and previous_lock.get("dependencies") != resolved_dependencies
+                ):
+                    write_sync_lock(lock_file, resolved_dependencies, state)
+
+                action = "Would install" if dry_run else "Installed"
+                print(f"{action} {len(destinations)} managed skills (unchanged)")
+                return
 
             for source, relative, routed in selected:
                 shutil.copytree(
@@ -644,7 +796,6 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
             for router, members in routers:
                 write_router(stage / router["name"], router, members)
 
-            current = repo_root / "_managed"
             old_names = (
                 {path.name for path in current.iterdir()} if current.is_dir() else set()
             )
@@ -657,7 +808,8 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
                 if not trees_equal(current / name, stage / name):
                     print(f"UPDATE {name}")
 
-            if not dry_run:
+            staged_fingerprint = tree_fingerprint(stage)
+            if not dry_run and live_fingerprint != staged_fingerprint:
                 backup = repo_root / f"._managed.backup.{uuid.uuid4().hex}"
                 moved_old = False
                 try:
@@ -671,6 +823,13 @@ def materialize(repo_root, dependencies, durable_roots, *, dry_run):
                     raise
                 if backup.exists():
                     shutil.rmtree(backup)
+
+            if not dry_run:
+                write_sync_lock(
+                    lock_file,
+                    resolved_dependencies,
+                    {"inputs": inputs, "output": staged_fingerprint},
+                )
                 print(f"Installed {len(new_names)} managed skills")
             else:
                 print(f"Would install {len(new_names)} managed skills")
@@ -721,20 +880,36 @@ def install_claude(repo_root, dependencies, durable_roots, target, *, dry_run):
             prefix=".skillctl-stage-", dir=target
         ) as temporary:
             stage = Path(temporary)
+            changed = set()
             for name, source in sources.items():
+                # Managed names are already normalized. Authored skills may still
+                # need their frontmatter name rewritten in the staged copy.
+                content = (source / "SKILL.md").read_text(encoding="utf-8")
+                frontmatter = FRONTMATTER.match(content)
+                name_line = (
+                    NAME_LINE.search(frontmatter.group(1)) if frontmatter else None
+                )
+                if (
+                    name in owned
+                    and name_line is not None
+                    and name_line.group(0) == f"name: {name}"
+                    and trees_equal(source, target / name)
+                ):
+                    continue
+
                 shutil.copytree(
                     source, stage / name, ignore=shutil.ignore_patterns(".git")
                 )
                 set_skill_name(stage / name, name)
+                if not trees_equal(target / name, stage / name):
+                    changed.add(name)
 
             for name in sorted(set(sources) - owned):
                 print(f"ADD {name}")
             for name in sorted(owned - set(sources)):
                 print(f"REMOVE {name}")
             for name in sorted(owned & set(sources)):
-                if not (target / name).is_dir() or not trees_equal(
-                    target / name, stage / name
-                ):
+                if name in changed:
                     print(f"UPDATE {name}")
 
             if dry_run:
@@ -748,7 +923,7 @@ def install_claude(repo_root, dependencies, durable_roots, target, *, dry_run):
             )
             for name in sorted(owned - set(sources)):
                 shutil.rmtree(target / name, ignore_errors=True)
-            for name in sorted(sources):
+            for name in sorted(changed):
                 destination = target / name
                 if destination.is_symlink() or destination.is_file():
                     destination.unlink()
