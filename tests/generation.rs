@@ -1,16 +1,18 @@
+use anyhow::{Context, Result};
 use serde_json::json;
 use skillctl::generation::{render_template, route_guides, set_skill_name, write_router};
 use skillctl::manifest::Router;
 use std::fs;
 use std::path::Path;
 
-fn write(path: &Path, content: impl AsRef<[u8]>) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, content).unwrap();
+fn write(path: &Path, content: impl AsRef<[u8]>) -> Result<()> {
+    fs::create_dir_all(path.parent().context("generated test file has no parent")?)?;
+    fs::write(path, content)?;
+    Ok(())
 }
 
 #[test]
-fn skill_name_only_changes_first_frontmatter_name() {
+fn skill_name_only_changes_first_frontmatter_name() -> Result<()> {
     for (original, expected) in [
         (
             "---\nname: review\ndescription: d\n---\nbody\nname: keep\n",
@@ -32,7 +34,7 @@ fn skill_name_only_changes_first_frontmatter_name() {
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("SKILL.md"), original);
+        write(&dir.path().join("SKILL.md"), original)?;
         set_skill_name(dir.path(), "unique").unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("SKILL.md")).unwrap(),
@@ -44,19 +46,21 @@ fn skill_name_only_changes_first_frontmatter_name() {
             expected
         );
     }
+
+    Ok(())
 }
 
 #[test]
-fn router_matches_description_escaping_and_markdown_bytes() {
+fn router_matches_description_escaping_and_markdown_bytes() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     write(
         &dir.path().join("skills/beta/GUIDE.md"),
         "---\ndescription: [broken\n---\n",
-    );
+    )?;
     write(
         &dir.path().join("skills/alpha/GUIDE.md"),
         "---\ndescription: >\n  Read quoted \"things\": then\n  use <tags> & café.\n---\n",
-    );
+    )?;
     let members = vec!["beta".to_owned(), "alpha".to_owned()];
     write_router(
         dir.path(),
@@ -78,10 +82,12 @@ fn router_matches_description_escaping_and_markdown_bytes() {
         expected
     );
     assert_eq!(members, ["beta", "alpha"]);
+
+    Ok(())
 }
 
 #[test]
-fn router_indexes_have_bounded_member_counts_and_character_threshold() {
+fn router_indexes_have_bounded_member_counts_and_character_threshold() -> Result<()> {
     for (count, description, index_count) in [
         (12, "short".to_owned(), 0),
         (13, "short".to_owned(), 2),
@@ -107,7 +113,7 @@ fn router_indexes_have_bounded_member_counts_and_character_threshold() {
             write(
                 &dir.path().join("skills").join(name).join("GUIDE.md"),
                 format!("---\ndescription: {description}\n---\n"),
-            );
+            )?;
         }
 
         write_router(
@@ -137,24 +143,26 @@ fn router_indexes_have_bounded_member_counts_and_character_threshold() {
             assert!(text.ends_with('\n'));
         }
     }
+
+    Ok(())
 }
 
 #[test]
-fn route_guides_rewrites_relative_local_references_only_and_preserves_binary_bytes() {
+fn route_guides_rewrites_relative_local_references_only_and_preserves_binary_bytes() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let original = "Read [nested](nested/SKILL.md#topic) and `nested/SKILL.md`.\nKeep https://example.com/SKILL.md and /absolute/SKILL.md and missing/SKILL.md and mailto:SKILL.md.\n";
-    write(&dir.path().join("SKILL.md"), original);
+    write(&dir.path().join("SKILL.md"), original)?;
     write(
         &dir.path().join("nested/SKILL.md"),
         "[parent](../SKILL.md)\n",
-    );
+    )?;
     write(
         &dir.path().join("nested/readme.md"),
         "`./SKILL.md` <../SKILL.md>\n",
-    );
+    )?;
     let untouched = b"raw\r\n\xff\nhttps://example.com/SKILL.md\n";
-    write(&dir.path().join("untouched.md"), untouched);
-    write(&dir.path().join("data.txt"), "nested/SKILL.md\n");
+    write(&dir.path().join("untouched.md"), untouched)?;
+    write(&dir.path().join("data.txt"), "nested/SKILL.md\n")?;
     route_guides(dir.path()).unwrap();
     assert_eq!(
         fs::read_to_string(dir.path().join("GUIDE.md")).unwrap(),
@@ -178,10 +186,12 @@ fn route_guides_rewrites_relative_local_references_only_and_preserves_binary_byt
     );
     assert!(!dir.path().join("SKILL.md").exists());
     assert!(!dir.path().join("nested/SKILL.md").exists());
+
+    Ok(())
 }
 
 #[test]
-fn collision_preserves_entire_tree_before_first_write() {
+fn collision_preserves_entire_tree_before_first_write() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let files = [
         ("SKILL.md", "nested/SKILL.md"),
@@ -189,7 +199,7 @@ fn collision_preserves_entire_tree_before_first_write() {
         ("nested/GUIDE.md", "existing"),
     ];
     for (path, content) in files {
-        write(&dir.path().join(path), content);
+        write(&dir.path().join(path), content)?;
     }
 
     assert!(
@@ -201,10 +211,12 @@ fn collision_preserves_entire_tree_before_first_write() {
     for (path, content) in files {
         assert_eq!(fs::read_to_string(dir.path().join(path)).unwrap(), content);
     }
+
+    Ok(())
 }
 
 #[test]
-fn strict_template_undefined_values_fail() {
+fn strict_template_undefined_values_fail() -> Result<()> {
     assert!(render_template("router.md.j2", json!({"router":{"name":"vendor"}})).is_err());
     assert!(
         render_template(
@@ -214,15 +226,17 @@ fn strict_template_undefined_values_fail() {
         .is_err()
     );
     assert!(render_template("missing", json!({})).is_err());
+
+    Ok(())
 }
 
 #[test]
-fn markdown_generation_preserves_non_utf8_body_and_header_bytes() {
+fn markdown_generation_preserves_non_utf8_body_and_header_bytes() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     write(
         &dir.path().join("SKILL.md"),
         b"---\nname: old\ndescription: \xff\n---\nbody\xff\n",
-    );
+    )?;
     set_skill_name(dir.path(), "unique").unwrap();
     assert_eq!(
         fs::read(dir.path().join("SKILL.md")).unwrap(),
@@ -231,7 +245,7 @@ fn markdown_generation_preserves_non_utf8_body_and_header_bytes() {
     write(
         &dir.path().join("skills/alpha/GUIDE.md"),
         b"---\ndescription: Read the guide.\n---\nbody\xff\n",
-    );
+    )?;
     write_router(
         dir.path(),
         &Router {
@@ -246,10 +260,12 @@ fn markdown_generation_preserves_non_utf8_body_and_header_bytes() {
             .unwrap()
             .contains(": Read the guide.\n")
     );
+
+    Ok(())
 }
 
 #[test]
-fn lock_template_preserves_structured_json_and_escapes_descriptions() {
+fn lock_template_preserves_structured_json_and_escapes_descriptions() -> Result<()> {
     let data = json!({
         "version": 1,
         "dependencies": [{"id":"vendor", "skills":[{"description":"café 😀 <tags> & \"quotes\""}], "nullable":null, "enabled":true}],
@@ -260,4 +276,6 @@ fn lock_template_preserves_structured_json_and_escapes_descriptions() {
     assert_eq!(actual, data);
     let text = String::from_utf8(rendered).unwrap();
     assert!(text.contains("caf\\u00e9 \\ud83d\\ude00 <tags> & \\\"quotes\\\""));
+
+    Ok(())
 }

@@ -99,7 +99,13 @@ pub(crate) fn acquire_dependency(dependency: &Dependency, cache: &Path) -> Resul
     })();
     if let Err(error) = result {
         // Failed refreshes never fall back to stale content.
-        let _ = fs::remove_dir_all(&clone);
+        if let Err(cleanup_error) = fs::remove_dir_all(&clone) {
+            return Err(error).context(format!(
+                "{} acquisition failed; cannot remove incomplete cache: {cleanup_error}",
+                dependency.id
+            ));
+        }
+
         return Err(error).with_context(|| format!("{} acquisition failed", dependency.id));
     }
 

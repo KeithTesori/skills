@@ -40,6 +40,12 @@ enum Commands {
     },
 }
 
+/// Run one `skillctl` command using the supplied process arguments.
+///
+/// # Errors
+///
+/// Returns an error when argument parsing, root discovery, manifest validation, or
+/// synchronization or installation fails.
 pub fn run(args: Vec<OsString>, out: &mut dyn Write) -> Result<()> {
     let cli = Cli::try_parse_from(args)?;
     let home = std::env::var_os("HOME")
