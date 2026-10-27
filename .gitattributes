@@ -1,0 +1,2 @@
+# Skill files, templates, and generated output are byte-compared; keep LF on every platform.
+* text=auto eol=lf

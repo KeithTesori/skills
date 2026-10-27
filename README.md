@@ -24,7 +24,7 @@ isolated worktrees, retaining validation and recovery evidence.
 
 ## Requirements
 
-- macOS or Linux (uses POSIX file locks)
+- macOS, Linux, or Windows
 - Git
 - Rust and Cargo (minimum version in `Cargo.toml`; the committed toolchain selects stable)
 - Network access to the Git repositories declared in `deps.yaml` and any
@@ -47,6 +47,24 @@ skillctl sync
 If `~/.agents/skills` already exists, inspect it before creating the symlink.
 Do not replace an existing directory until its authored content and local
 configuration have been preserved.
+
+### Windows
+
+Symlinks need Developer Mode or elevation, so skip the link and run from the
+checkout (or pass `--root`); `sync` still installs into `~/.claude/skills`:
+
+```powershell
+git clone https://github.com/kellen-miller/skills.git $HOME\source\repos\skills
+cd $HOME\source\repos\skills
+cargo install --path . --locked
+skillctl sync
+```
+
+The MSVC toolchain needs the Visual Studio C++ workload and Windows SDK. Without
+them, use `rustup set default-host x86_64-pc-windows-gnu` with a MinGW-w64
+toolchain such as WinLibs on `PATH`. The `.gitattributes` keeps checkouts LF
+regardless of `core.autocrlf`, and `skillctl` forces LF and long paths in its
+own dependency clones.
 
 ## Repository Layout
 

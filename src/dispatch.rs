@@ -1,11 +1,8 @@
 //! Execute approved immutable ticket graphs with durable local Git evidence.
+use crate::process::{Stop, group_alive, signal_group, spawn_group};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use nix::{
-    sys::signal::{self, Signal},
-    unistd::Pid,
-};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,7 +12,6 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -87,9 +83,11 @@ struct State {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    // Worker worktrees sit in a deeper sibling directory; Windows needs long paths.
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "core.longpaths=true"])
         .args(args)
         .output()?;
     ensure!(
@@ -154,9 +152,8 @@ fn checks(value: &Value) -> Result<Vec<Vec<String>>> {
 }
 
 fn ignored_file(repo: &Path, path: &Path) -> Result<PathBuf> {
-    let path = path
-        .canonicalize()
-        .context("graph and briefs must be files under .agent/work/")?;
+    let path =
+        dunce::canonicalize(path).context("graph and briefs must be files under .agent/work/")?;
     let relative = path
         .strip_prefix(repo)
         .context("graph and briefs must be files under .agent/work/")?;
@@ -490,23 +487,14 @@ fn frontier(graph: &Graph, state: &State) -> Vec<String> {
 }
 
 fn process_alive(pid: u32) -> Result<bool> {
-    let output = Command::new("ps").args(["-axo", "pgid=,stat="]).output()?;
-    ensure!(output.status.success(), "cannot inspect process groups");
-    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|row| {
-        let mut fields = row.split_whitespace();
-        fields.next().and_then(|v| v.parse::<u32>().ok()) == Some(pid)
-            && fields.next().is_some_and(|s| !s.starts_with('Z'))
-    }))
+    group_alive(pid)
 }
 
 fn stop_process(child: &mut Child) -> Result<()> {
     let pid = child.id();
     if process_alive(pid)? {
-        match signal::killpg(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => {
-                ensure!(!process_alive(pid)?, "cannot stop worker group: {error}");
-            }
+        if let Err(error) = signal_group(pid, Stop::Terminate) {
+            ensure!(!process_alive(pid)?, "cannot stop worker group: {error}");
         }
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -518,13 +506,10 @@ fn stop_process(child: &mut Child) -> Result<()> {
             thread::sleep(Duration::from_millis(20));
         }
 
-        if process_alive(pid)? {
-            match signal::killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                Err(error) => {
-                    ensure!(!process_alive(pid)?, "cannot kill worker group: {error}");
-                }
-            }
+        if process_alive(pid)?
+            && let Err(error) = signal_group(pid, Stop::Kill)
+        {
+            ensure!(!process_alive(pid)?, "cannot kill worker group: {error}");
         }
     }
 
@@ -584,7 +569,7 @@ struct Worker {
 
 impl Worker {
     fn spawn(mut cmd: Command, timeout: Duration) -> Result<Self> {
-        let child = Arc::new(Mutex::new(cmd.process_group(0).spawn()?));
+        let child = Arc::new(Mutex::new(spawn_group(&mut cmd)?));
         let cancelled = Arc::new(AtomicBool::new(false));
         let expired = Arc::new(AtomicBool::new(false));
         let watch_error = Arc::new(Mutex::new(None));
@@ -735,14 +720,14 @@ fn run_checks(
         );
         writeln!(log, "\nCHECK {}", serde_json::to_string(argv)?)?;
         log.flush()?;
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log.try_clone()?)
-            .process_group(0)
-            .spawn()?;
+        let mut child = spawn_group(
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log.try_clone()?),
+        )?;
         let deadline = Instant::now() + timeout;
         let status = loop {
             if interruption().load(Ordering::SeqCst) || Instant::now() >= deadline {
@@ -1417,9 +1402,9 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         }
         Err(error) => return Err(anyhow!(error.to_string())),
     };
-    let repo = args.repo.canonicalize()?;
+    let repo = dunce::canonicalize(&args.repo)?;
     ensure!(
-        Path::new(&git_text(&repo, &["rev-parse", "--show-toplevel"])?).canonicalize()? == repo,
+        dunce::canonicalize(git_text(&repo, &["rev-parse", "--show-toplevel"])?)? == repo,
         "--repo must name the integration worktree root"
     );
     let graph = load_graph(&repo, &args.graph)?;
@@ -1521,8 +1506,16 @@ mod tests {
             tickets: BTreeMap::new(),
             digest: "graph".to_owned(),
         };
+        #[cfg(unix)]
         let mut command = Command::new("sleep");
+        #[cfg(unix)]
         command.arg("30");
+        #[cfg(windows)]
+        let mut command = Command::new("ping");
+        #[cfg(windows)]
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null());
         let worker = Worker::spawn(command, Duration::from_secs(60))?;
         let pid = worker.child_process()?.id();
         *worker

@@ -5,5 +5,6 @@ pub mod generation;
 mod git;
 mod lock;
 pub mod manifest;
+mod process;
 pub mod sync;
 mod tree;

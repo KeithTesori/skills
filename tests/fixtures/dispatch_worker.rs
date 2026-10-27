@@ -8,6 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A detached 30-second descendant, portable across platforms.
+fn sleeper() -> process::Child {
+    Command::new(std::env::current_exe().unwrap())
+        .args(["check-sleep", "30000"])
+        .spawn()
+        .unwrap()
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let mode = &args[1];
@@ -22,7 +30,7 @@ fn main() {
             return;
         }
         "check-child" => {
-            let child = Command::new("sleep").arg("30").spawn().unwrap();
+            let child = sleeper();
             fs::write(&args[2], child.id().to_string()).unwrap();
             return;
         }
@@ -51,7 +59,7 @@ fn main() {
         }
         "slow" => thread::sleep(Duration::from_secs(30)),
         "child-fail" if !Path::new(&args[4]).exists() => {
-            let child = Command::new("sleep").arg("30").spawn().unwrap();
+            let child = sleeper();
             fs::write(&args[3], child.id().to_string()).unwrap();
             process::exit(7);
         }

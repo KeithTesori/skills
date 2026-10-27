@@ -51,7 +51,10 @@ pub(crate) fn sync_lock(root: &Path) -> Result<File> {
         .truncate(false)
         .open(root.join(".skillctl.lock"))?;
     if let Err(error) = FileExt::try_lock_exclusive(&file) {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        // Windows reports contention as a lock violation, not WouldBlock.
+        if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
             bail!("another sync is in progress");
         }
 

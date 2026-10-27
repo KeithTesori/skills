@@ -49,6 +49,7 @@ enum Commands {
 pub fn run(args: Vec<OsString>, out: &mut dyn Write) -> Result<()> {
     let cli = Cli::try_parse_from(args)?;
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .context("HOME is not set")?;
     let (root, target, dry_run, run_sync, no_claude) = match cli.command {
@@ -85,19 +86,19 @@ pub fn run(args: Vec<OsString>, out: &mut dyn Write) -> Result<()> {
 
 fn discover_root(explicit: Option<&Path>, home: &Path) -> Result<PathBuf> {
     if let Some(root) = explicit {
-        return Ok(std::fs::canonicalize(root)?);
+        return Ok(dunce::canonicalize(root)?);
     }
 
     let current = std::env::current_dir()?;
     for directory in current.ancestors() {
         if directory.join("deps.yaml").is_file() {
-            return Ok(std::fs::canonicalize(directory)?);
+            return Ok(dunce::canonicalize(directory)?);
         }
     }
 
     let fallback = home.join(".agents/skills");
     if fallback.join("deps.yaml").is_file() {
-        return Ok(std::fs::canonicalize(fallback)?);
+        return Ok(dunce::canonicalize(fallback)?);
     }
 
     bail!("cannot find skills checkout; pass --root or install ~/.agents/skills")

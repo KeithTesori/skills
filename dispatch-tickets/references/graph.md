@@ -1,8 +1,11 @@
 # Ticket graph and CLI protocol
 
 Install `dispatch-tickets` with `cargo install --path ~/.agents/skills --locked`.
-Git, `ps`, and POSIX process groups/file locks are required on macOS/Linux. No
-provider SDK is required. Its checks and owned
+On macOS/Linux, Git, `ps`, and POSIX process groups/file locks are required.
+On Windows, each worker and check runs in a Job Object: its descendants are
+tracked and stopped together, and are killed if the dispatcher exits. Windows
+has no catchable SIGTERM, so stopping a worker is immediate rather than graceful.
+No provider SDK is required. Its checks and owned
 paths validate results; they are not an operating-system security boundary.
 Configure each worker CLI's own permissions for the repository.
 

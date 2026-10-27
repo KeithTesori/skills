@@ -3,11 +3,24 @@ use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, Metadata},
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+/// Device and inode, where the platform exposes a stable file identity.
+#[cfg(unix)]
+fn identity(info: &Metadata) -> Option<(u64, u64)> {
+    Some((info.dev(), info.ino()))
+}
+
+#[cfg(windows)]
+fn identity(_: &Metadata) -> Option<(u64, u64)> {
+    None
+}
 
 const SOURCE_URL: &str = "https://github.com/example/source.git";
 
@@ -157,7 +170,7 @@ fn absent(path: impl AsRef<Path>) -> Result<()> {
 
 fn unchanged(before: &Metadata, path: impl AsRef<Path>) -> Result<()> {
     let after = fs::metadata(path)?;
-    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(identity(before), identity(&after));
     assert_eq!(before.modified()?, after.modified()?);
     Ok(())
 }
@@ -285,6 +298,7 @@ fn discovery_follows_renames_and_dependency_removal() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn sync_repairs_local_edits_missing_files_modes_and_stray_git() -> Result<()> {
     let f = Fixture::new()?;
@@ -377,7 +391,7 @@ fn malformed_empty_and_trailing_lock_records_are_repaired_in_place() -> Result<(
     f.sync()?;
     let before = fs::metadata(f.installed()).unwrap();
     let original = fs::read(f.lock_path()).unwrap();
-    let inode = fs::metadata(f.lock_path()).unwrap().ino();
+    let inode = identity(&fs::metadata(f.lock_path()).unwrap());
     for contents in [
         Vec::new(),
         b"broken".to_vec(),
@@ -387,7 +401,7 @@ fn malformed_empty_and_trailing_lock_records_are_repaired_in_place() -> Result<(
         write(f.lock_path(), contents)?;
         f.sync()?;
         assert_eq!(f.lock()?["version"], 1);
-        assert_eq!(fs::metadata(f.lock_path()).unwrap().ino(), inode);
+        assert_eq!(identity(&fs::metadata(f.lock_path()).unwrap()), inode);
         unchanged(&before, f.installed())?;
     }
 
@@ -525,6 +539,8 @@ fn sparse_selection_change_uses_new_contents() -> Result<()> {
     Ok(())
 }
 
+// Creating symlinks needs elevated rights or Developer Mode on Windows.
+#[cfg(unix)]
 #[test]
 fn safe_symlink_targets_outside_selection_and_aliased_ancestors_refresh() -> Result<()> {
     let mut f = Fixture::new()?;
@@ -557,6 +573,7 @@ fn safe_symlink_targets_outside_selection_and_aliased_ancestors_refresh() -> Res
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn escaping_and_cyclic_symlinks_fail_without_publishing() -> Result<()> {
     for cycle in [false, true] {
@@ -624,8 +641,9 @@ fn root_and_shared_cache_locks_exclude_cli_processes() -> Result<()> {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("another sync is in progress"));
         unchanged(&before, f.installed())?;
-        assert_eq!(lock_contents, fs::read(f.lock_path()).unwrap());
+        // Windows file locks are mandatory, so read only after releasing.
         FileExt::unlock(&held).unwrap();
+        assert_eq!(lock_contents, fs::read(f.lock_path()).unwrap());
     }
 
     f.sync()?;

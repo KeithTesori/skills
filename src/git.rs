@@ -9,8 +9,11 @@ use std::{
 };
 
 pub(crate) fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    // Managed output must match upstream bytes, and Windows checkouts of deep
+    // skill trees exceed MAX_PATH; neither may depend on user Git config.
     let output = Command::new("git")
         .current_dir(root)
+        .args(["-c", "core.autocrlf=false", "-c", "core.longpaths=true"])
         .args(args)
         .output()
         .context("cannot start Git")?;
@@ -33,7 +36,9 @@ pub(crate) fn cache_root() -> Result<PathBuf> {
         return Ok(base.join("skillctl"));
     }
 
-    let home = env::var_os("HOME").context("HOME is not set")?;
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".cache/skillctl"))
 }
 

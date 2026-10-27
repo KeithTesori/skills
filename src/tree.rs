@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -37,7 +36,7 @@ pub(crate) fn tree_fingerprint(root: &Path) -> Result<String> {
         digest.update(serde_json::to_vec(&(
             relative,
             kind,
-            info.permissions().mode(),
+            mode(&info),
             content.len(),
         ))?);
         digest.update(b"\n");
@@ -45,6 +44,17 @@ pub(crate) fn tree_fingerprint(root: &Path) -> Result<String> {
     }
 
     Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(unix)]
+fn mode(info: &fs::Metadata) -> u32 {
+    std::os::unix::fs::PermissionsExt::mode(&info.permissions())
+}
+
+/// Windows has no mode bits; read-only is the only permission to compare.
+#[cfg(windows)]
+fn mode(info: &fs::Metadata) -> u32 {
+    u32::from(info.permissions().readonly())
 }
 
 pub(crate) fn trees_equal(left: &Path, right: &Path) -> Result<bool> {

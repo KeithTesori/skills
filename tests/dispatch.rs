@@ -1,27 +1,35 @@
 use anyhow::Result;
 use fs2::FileExt;
+use serde_json::{Value, json};
+use std::{
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    sync::OnceLock,
+};
+use tempfile::TempDir;
+
+#[cfg(unix)]
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use serde_json::{Value, json};
+#[cfg(unix)]
 use std::{
-    fs::{self, OpenOptions},
     os::unix::process::CommandExt,
-    path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    sync::OnceLock,
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
-use tempfile::TempDir;
 
 fn worker_binary() -> Result<&'static Path> {
     static FIXTURE: OnceLock<Result<(TempDir, PathBuf), String>> = OnceLock::new();
     let fixture = FIXTURE.get_or_init(|| {
         let fixture = (|| -> Result<(TempDir, PathBuf)> {
             let directory = tempfile::tempdir()?;
-            let binary = directory.path().join("worker");
+            let binary = directory
+                .path()
+                .join(format!("worker{}", std::env::consts::EXE_SUFFIX));
             let result = Command::new("rustc")
                 .args(["--edition=2024", "tests/fixtures/dispatch_worker.rs", "-o"])
                 .arg(&binary)
@@ -70,6 +78,7 @@ impl Fixture {
         };
         fixture.git(&["init", "-b", "main"])?;
         fixture.git(&["config", "user.name", "Test User"])?;
+        fixture.git(&["config", "core.autocrlf", "false"])?;
         fixture.git(&["config", "user.email", "test@example.com"])?;
         fixture.git(&["config", "commit.gpgsign", "false"])?;
         fixture.git(&["config", "core.hooksPath", "/dev/null"])?;
@@ -187,6 +196,22 @@ fn failed(output: Output, message: &str) {
     );
 }
 
+#[cfg(windows)]
+fn stopped(pid: &Path) -> Result<()> {
+    let pid = fs::read_to_string(pid)?;
+    let filter = format!("PID eq {}", pid.trim());
+    let result = Command::new("tasklist")
+        .args(["/FI", &filter, "/NH", "/FO", "CSV"])
+        .output()?;
+    let status = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !status.contains(&format!("\"{}\"", pid.trim())),
+        "child remains live: {status}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 fn stopped(pid: &Path) -> Result<()> {
     let pid = fs::read_to_string(pid)?;
     let result = Command::new("ps")
@@ -527,7 +552,12 @@ fn completed_merge_reconciled_after_state_write_interruption() -> Result<()> {
 fn missing_cli_blocks_without_fallback() -> Result<()> {
     let mut f = Fixture::new()?;
     f.data["tickets"][0]["worker_command"] = json!([f.root.path().join("missing-cli")]);
-    failed(f.call(&["run", "--jobs", "1"])?, "No such file");
+    let missing = if cfg!(windows) {
+        "cannot find the file"
+    } else {
+        "No such file"
+    };
+    failed(f.call(&["run", "--jobs", "1"])?, missing);
     assert_eq!(f.state()?["tasks"]["a"]["status"], "blocked");
     assert_eq!(f.git(&["rev-parse", "HEAD"])?, f.initial);
 
@@ -572,6 +602,8 @@ fn unrelated_integration_edits_preserved_before_merge() -> Result<()> {
     Ok(())
 }
 
+// Relies on a POSIX shell trapping SIGTERM; Windows workers are killed outright.
+#[cfg(unix)]
 #[test]
 fn deadline_enforced_during_checks_before_new_launches() -> Result<()> {
     let mut f = Fixture::new()?;
@@ -612,11 +644,11 @@ fn blocked_retry_refuses_live_previous_worker_group() -> Result<()> {
     let gate = f.root.path().join("gate");
     f.mode(0, "fail", &[&gate])?;
     failed(f.call(&["run", "--jobs", "1"])?, "worker failed");
-    let mut child = Command::new("sleep")
-        .arg("30")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut command = Command::new(worker_binary()?);
+    command.args(["check-sleep", "30000"]);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().unwrap();
     let operation = (|| {
         let mut state = f.state()?;
         state["tasks"]["a"]["pid"] = json!(child.id());
@@ -676,6 +708,8 @@ fn worker_must_leave_head_branch_and_nonempty_owned_edits() -> Result<()> {
     Ok(())
 }
 
+// Windows cannot deliver SIGTERM to another process; Ctrl+C is the equivalent.
+#[cfg(unix)]
 #[test]
 fn foreground_cancellation_stops_worker_groups_and_retains_state() -> Result<()> {
     let mut f = Fixture::new()?;
