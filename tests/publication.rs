@@ -33,11 +33,13 @@ fn tracked_paths() -> Result<Vec<String>> {
 #[test]
 fn tracked_tree_contains_only_owned_rust_and_public_skill_content() -> Result<()> {
     let allowed = [
+        ".gitattributes",
         ".gitignore",
         ".github/ruleset-requirements.json",
         "LICENSE",
         "README.md",
         "deps.yaml",
+        "deps.local.example.yaml",
         "Cargo.toml",
         "Cargo.lock",
         ".jscpd.json",
