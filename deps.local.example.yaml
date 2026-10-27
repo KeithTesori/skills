@@ -1,0 +1,13 @@
+version: 1
+# Machine-local overlay (git-ignored). Drops cloud/vendor bundles not used here.
+# Keep useful-codex-skills, mattpocock-skills, and superpowers: grill-plan-build
+# depends on them. redpanda-skills stays for RedpandaEval.
+remove:
+  - aws-agent-toolkit
+  - azure-skills # covered by the Azure plugin
+  - cloudflare-skills
+  - datadog-pup
+  - googleworkspace-cli
+  - grafana-gcx
+  - openfga
+  - terraform-skill

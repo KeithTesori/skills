@@ -295,7 +295,8 @@ the synchronization, and run the tests.
 
 Use the ignored `deps.local.yaml` for dependencies that should exist only on
 one machine. Back this file up separately because it is intentionally not
-published with the repository.
+published with the repository. `deps.local.example.yaml` is a tracked starting
+point; copy it to `deps.local.yaml` and adjust.
 
 The overlay supports three operations:
 
