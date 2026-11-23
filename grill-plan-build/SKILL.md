@@ -158,13 +158,17 @@ handoff. Completion requires that evidence, not merely successful worker exits
 or a finished dispatcher run. Let Goalcraft validate the objective and activate
 it through the available native Goal surface; record its identifier when exposed.
 
-In Claude Code, `/goal` can only be set by the user. Skip Goalcraft's
-activation step: do not search for a goal tool or start `claude -p` to set one.
-Save the validated `/goal ...` line to `goal.md` in the work item, present it in
-one fenced block, and end the turn so the user can run it. Begin dispatch on the
-next turn, after the user has run it, or continue without a Goal only if the
-user explicitly says to. Never say "no native Goal tool exists" or proceed as if
-one was activated.
+In Claude Code, do not activate a Goal by default; plan approval authorizes
+dispatch. Still use Goalcraft to draft and validate the objective, save it to
+`goal.md` in the work item as the completion contract, and skip Goalcraft's
+activation step: do not search for a goal tool, start `claude -p` to set one, or
+ask the user to run `/goal`. Begin dispatch in the same turn and use `goal.md`
+as the finish line: keep reconciling, diagnosing, and retrying within the
+approved scope through integrated validation, independent review, and the
+authorized handoff, stopping early only for a decision the user must make. If
+the user asks for an active Goal, present the saved `/goal ...` line in one
+fenced block and end the turn so they can run it. Never claim a Goal is active
+unless the user ran it.
 
 The Goal supplies persistence and completion criteria. The task graph supplies
 dependency order; the selected executor below owns scheduling and Git transfer.
